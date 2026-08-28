@@ -371,18 +371,12 @@ func (u *Unpacker) unpack(
 	copy(chainIDs, diffIDs)
 	chainIDs = identity.ChainIDs(chainIDs)
 
-	// Refill layer blobs whose snapshot for this snapshotter already exists
-	// but whose content has been discarded (e.g. left behind by a prior
-	// discard_unpacked_layers=true run). The snapshot loop below short-circuits
-	// on existing chainIDs and won't fetch, so do it here in parallel — reusing
-	// u.fetch's per-blob lock and concurrency limiter — before the per-chainID
-	// snapshot locks are taken.
-	//
-	// Check the content store first: on a healthy node every blob is present,
-	// so this avoids a snapshotter Stat per layer on every unpack. Only when a
-	// blob is missing do we Stat the snapshot to decide whether it needs
-	// refilling — if the snapshot is also missing, the loop below fetches and
-	// unpacks the layer as usual.
+	// Re-fetch layer blobs whose snapshot already exists but whose content was
+	// discarded. The snapshot loop below short-circuits on existing chainIDs
+	// and won't fetch, so missing blobs must be refilled here. Check the
+	// content store first to avoid a snapshotter Stat per layer on the healthy
+	// path; only Stat when a blob is missing, and skip if the snapshot is also
+	// missing (the loop below will fetch and unpack as usual).
 	var missingBlobs []ocispec.Descriptor
 	for li, ldesc := range layers {
 		if _, err := cs.Info(ctx, ldesc.Digest); err == nil {

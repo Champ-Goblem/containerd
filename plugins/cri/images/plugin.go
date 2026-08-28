@@ -119,12 +119,9 @@ func init() {
 			if _, ok := allSnapshotters[defaultSnapshotter]; !ok {
 				return nil, fmt.Errorf("failed to find snapshotter %q", defaultSnapshotter)
 			}
-			// Register every available snapshotter, not just the default. Runtime
-			// plugins propagate their per-runtime snapshotters (e.g. kata's
-			// containerd.runtimes.<name>.snapshotter) via UpdateRuntimeSnapshotter
-			// *after* this plugin initializes, so any snapshotter referenced later
-			// must already be present here for ImageStatus's snapshot-existence
-			// check to consult the correct snapshotter.
+			// Register every available snapshotter, not just the default, so
+			// ImageStatus can consult per-runtime snapshotters that are
+			// propagated via UpdateRuntimeSnapshotter after this plugin init.
 			maps.Copy(options.Snapshotters, allSnapshotters)
 
 			snapshotRoot := func(snapshotter string) (snapshotRoot string) {

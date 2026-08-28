@@ -47,32 +47,20 @@ func (c *CRIImageService) ImageStatus(ctx context.Context, r *runtime.ImageStatu
 		return nil, fmt.Errorf("can not resolve %q locally: %w", r.GetImage().GetImage(), err)
 	}
 
-	// Verify the corresponding snapshot exists for the snapshotter that would
-	// be used by the next container creation. If it doesn't, the image is not
-	// usable as-is (e.g. layer content has been discarded by
-	// discard_unpacked_layers and the snapshotter has since changed) and
-	// reporting it absent prompts the caller to re-pull it with credentials
-	// they hold, restoring any missing layer content along the way. This fires
-	// when kubelet passes the pod's runtime handler (RuntimeClassInImageCriAPI
-	// feature gate enabled), so the per-runtime snapshotter is consulted.
-	if !c.imageSnapshotExists(ctx, image, r.GetImage()) {
+	// Report the image absent when its layer blobs are gone — the corrupt
+	// state left by a prior discard_unpacked_layers=true run — so kubelet
+	// re-pulls to restore them. The snapshot check is gated on missing blobs:
+	// a missing snapshot alone is a valid not-yet-unpacked state (e.g. the
+	// sandbox image pulled outside CRI), not an unusable one.
+	blobsPresent := c.imageBlobsPresent(ctx, image)
+	if !blobsPresent && !c.imageSnapshotExists(ctx, image, r.GetImage()) {
 		return &runtime.ImageStatusResponse{}, nil
 	}
-
-	// When discard_unpacked_layers is false, every layer blob should be in the
-	// content store. If any is missing, the image is in the corrupt state left
-	// behind by a prior discard_unpacked_layers=true run (which discarded the
-	// blobs while keeping the manifest and snapshot intact). A present snapshot
-	// is not sufficient: re-unpacking the image — for another snapshotter, or
-	// any operation that needs the layers — requires the blobs, and the CRI
-	// container path has no fetcher of its own. This check is independent of
-	// imageSnapshotExists on purpose: it is the only signal available when the
-	// runtime handler is not passed (RuntimeClassInImageCriAPI disabled), where
-	// the snapshot check only ever sees the default snapshotter. Reporting the
-	// image absent triggers kubelet (which holds the pull credentials) to
-	// re-pull, and the unpacker repopulates the blobs even when it
-	// short-circuits on an existing snapshot.
-	if !c.config.DiscardUnpackedLayers && !c.imageBlobsPresent(ctx, image) {
+	// With discard_unpacked_layers disabled, missing blobs alone make the
+	// image unusable: it can't be re-unpacked for another snapshotter, and
+	// the CRI container path has no fetcher. This also covers the no-handler
+	// case, where the snapshot check only sees the default snapshotter.
+	if !c.config.DiscardUnpackedLayers && !blobsPresent {
 		return &runtime.ImageStatusResponse{}, nil
 	}
 
@@ -88,13 +76,9 @@ func (c *CRIImageService) ImageStatus(ctx context.Context, r *runtime.ImageStatu
 	}, nil
 }
 
-// targetSnapshotter resolves the snapshotter that the runtime handler in spec
-// would use for the next container creation, mirroring RuntimeSnapshotter in
-// the container-create path: a per-runtime snapshotter override if the handler
-// has one, otherwise the configured default. This is the only image-state axis
-// that varies per runtime here — the platform does not, because the CRI image
-// store records a single chainID computed for platforms.Default() and the
-// container-create unpack (unpackImage) likewise unpacks platforms.Default().
+// targetSnapshotter resolves the snapshotter the runtime handler in spec would
+// use for the next container creation: the per-runtime override if set,
+// otherwise the configured default.
 func (c *CRIImageService) targetSnapshotter(spec *runtime.ImageSpec) string {
 	snapshotter := c.config.Snapshotter
 	if spec != nil {
@@ -107,13 +91,10 @@ func (c *CRIImageService) targetSnapshotter(spec *runtime.ImageSpec) string {
 	return snapshotter
 }
 
-// imageSnapshotExists reports whether the chainID-rooted snapshot for the
-// given image exists in the snapshotter that would handle the next container
-// creation. It returns false only when the snapshot is conclusively missing;
-// whenever the check cannot be performed conclusively — missing chainID, no
-// tracked snapshotters, the target snapshotter not registered with this
-// service, or a transient snapshotter error — it returns true so that the
-// usability check never turns into an availability regression for ImageStatus.
+// imageSnapshotExists reports whether the image's chainID snapshot exists in
+// the snapshotter for the next container creation. It returns false only when
+// the snapshot is conclusively missing; on any inconclusive result it returns
+// true so the check never causes an availability regression.
 func (c *CRIImageService) imageSnapshotExists(ctx context.Context, image imagestore.Image, spec *runtime.ImageSpec) bool {
 	if image.ChainID == "" {
 		return true
@@ -137,16 +118,10 @@ func (c *CRIImageService) imageSnapshotExists(ctx context.Context, image imagest
 }
 
 // imageBlobsPresent reports whether every layer blob referenced by the image's
-// manifest is currently in the content store. It is consulted only when
-// discard_unpacked_layers is false, where blob presence is the expected steady
-// state; a missing blob then indicates the corrupt state left by a prior
-// discard_unpacked_layers=true run and the image must be re-pulled to restore
-// it. The manifest is selected for platforms.Default(), matching both the
-// chainID the CRI image store records and the platform unpackImage unpacks on
-// the container-create path. The check is tolerant: if anything along the way
-// (image lookup, manifest read, content store access) prevents a definitive
-// answer, the image is treated as present so this check never turns into an
-// availability regression for ImageStatus.
+// manifest is in the content store. The manifest is resolved for
+// platforms.Default(), matching the chainID the CRI image store records. The
+// check is tolerant: if anything prevents a definitive answer, the image is
+// treated as present so the check never causes an availability regression.
 func (c *CRIImageService) imageBlobsPresent(ctx context.Context, image imagestore.Image) bool {
 	if c.content == nil || c.images == nil {
 		return true

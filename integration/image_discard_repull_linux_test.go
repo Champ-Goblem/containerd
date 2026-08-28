@@ -39,27 +39,11 @@ import (
 	"github.com/containerd/platforms"
 )
 
-// TestImageStatusDiscardedLayersSnapshotterSwitch reproduces the problem where
-// an image pulled with discard_unpacked_layers=true becomes unusable for a
-// snapshotter other than the one it was originally unpacked into, yet is still
-// reported as present by ImageStatus.
-//
-// With discard_unpacked_layers=true, the layer blobs are dropped from the
-// content store after the image is unpacked into the pull-time snapshotter
-// (here, overlayfs). If a container is later created with a runtime handler
-// backed by a different snapshotter (here, native), CreateContainer must unpack
-// the image into that snapshotter — but it has no fetcher, so with the blobs
-// gone the unpack is impossible. Before the fix, ImageStatus still reported the
-// image present, so kubelet (which holds the pull credentials) never re-pulled
-// it and container creation failed.
-//
-// The fix makes ImageStatus consult the snapshotter that the *queried* runtime
-// handler would use: the image is reported absent for the native handler (no
-// snapshot, blobs gone) while remaining present for the default overlayfs
-// handler (snapshot intact). Re-pulling — what kubelet does in response to the
-// absent status — then restores the discarded layer blobs to the content
-// store, healing the image (the native unpack itself happens later, when a
-// native container is created).
+// TestImageStatusDiscardedLayersSnapshotterSwitch verifies that an image pulled
+// with discard_unpacked_layers=true is reported absent for a runtime handler
+// whose snapshotter it was never unpacked into (blobs gone, no snapshot),
+// while remaining present for the default snapshotter (snapshot intact), and
+// that a re-pull restores the discarded blobs.
 func TestImageStatusDiscardedLayersSnapshotterSwitch(t *testing.T) {
 	workDir := t.TempDir()
 	cfgPath := filepath.Join(workDir, "config.toml")
@@ -120,9 +104,8 @@ version = 3
 
 	testImage := images.Get(images.BusyBox)
 
-	// 1. Pull with the default handler. The image is unpacked into overlayfs
-	//    and, because discard_unpacked_layers=true, its layer blobs become
-	//    unreferenced in the content store.
+	// 1. Pull into overlayfs; with discard_unpacked_layers=true the layer
+	//    blobs become unreferenced in the content store.
 	pullImagesByCRI(t, iSvc, testImage)
 
 	img, err := ctrdClient.GetImage(context.Background(), testImage)
@@ -136,9 +119,7 @@ version = 3
 	require.NoError(t, err)
 	require.NotEmpty(t, manifest.Layers)
 
-	// 2. Drop the now-unreferenced layer blobs, emulating the garbage
-	//    collection that discard_unpacked_layers relies on. content.Delete is
-	//    a direct removal, so this is deterministic regardless of GC timing.
+	// 2. Drop the now-unreferenced layer blobs, emulating GC.
 	cs := ctrdClient.ContentStore()
 	layerDigests := make([]digest.Digest, 0, len(manifest.Layers))
 	for _, layer := range manifest.Layers {
@@ -159,10 +140,9 @@ version = 3
 		require.Truef(t, errdefs.IsNotFound(err), "unexpected native snapshot for chainID %s", chainID)
 	}
 
-	// 3. The core assertion. ImageStatus for the native handler must report the
-	//    image absent (no native snapshot, blobs gone — it cannot be used),
-	//    while the default overlayfs handler still reports it present (the
-	//    overlayfs snapshot is intact). Before the fix both reported present.
+	// 3. ImageStatus for the native handler must report absent (no native
+	//    snapshot, blobs gone); the default overlayfs handler must report
+	//    present (snapshot intact).
 	nativeStatus, err := iSvc.ImageStatus(&criruntime.ImageSpec{Image: testImage, RuntimeHandler: "native"})
 	require.NoError(t, err)
 	assert.Nil(t, nativeStatus, "image unusable for the native snapshotter should be reported absent")
@@ -171,13 +151,7 @@ version = 3
 	require.NoError(t, err)
 	require.NotNil(t, overlayStatus, "image is still usable for the default overlayfs handler")
 
-	// 4. Re-pull — the action kubelet takes in response to the absent status —
-	//    restores the discarded layer blobs to the content store, healing the
-	//    image. With a nil sandbox config the pull targets the default
-	//    (overlayfs) snapshotter, whose chainID snapshots already exist; the
-	//    unpacker therefore short-circuits the snapshot creation and the blobs
-	//    are restored by its blob-refill preflight. Layer blobs are
-	//    snapshotter-independent content, so this is what we assert on.
+	// 4. Re-pull restores the discarded layer blobs to the content store.
 	_, err = iSvc.PullImage(&criruntime.ImageSpec{Image: testImage}, nil, nil, "")
 	require.NoError(t, err)
 
@@ -187,19 +161,11 @@ version = 3
 	}
 }
 
-// TestImageStatusDiscardedLayersNoRuntimeHandler reproduces the same underlying
-// problem in the configuration where kubelet's RuntimeClassInImageCriAPI
-// feature gate is DISABLED, so ImageStatus is called with no runtime handler.
-//
-// This is the case the snapshotter-switch test cannot cover: with no handler,
-// ImageStatus resolves the default snapshotter, whose chainID snapshot exists,
-// so the snapshot-existence check passes. The only thing that can still detect
-// the discarded content is the independent blob check (active because
-// discard_unpacked_layers is false — the steady state after a node is switched
-// off discard). It must report the image absent so kubelet re-pulls and
-// restores the blobs; otherwise a later re-unpack (a different runtime's
-// snapshotter, or any operation needing the layers) fails with the layer
-// content missing from the content store.
+// TestImageStatusDiscardedLayersNoRuntimeHandler covers the no-runtime-handler
+// path (RuntimeClassInImageCriAPI disabled): the default snapshot exists so the
+// snapshot check passes, leaving the blob check as the only signal that the
+// image is unusable. With discard_unpacked_layers=false, missing blobs must
+// report the image absent so kubelet re-pulls and restores them.
 func TestImageStatusDiscardedLayersNoRuntimeHandler(t *testing.T) {
 	workDir := t.TempDir()
 	cfgPath := filepath.Join(workDir, "config.toml")
@@ -242,8 +208,7 @@ version = 3
 
 	testImage := images.Get(images.BusyBox)
 
-	// 1. Pull (no handler) into the default overlayfs snapshotter. With
-	//    discard_unpacked_layers=false the layer blobs are retained.
+	// 1. Pull into overlayfs; blobs are retained (discard=false).
 	pullImagesByCRI(t, iSvc, testImage)
 
 	img, err := ctrdClient.GetImage(context.Background(), testImage)
@@ -252,10 +217,7 @@ version = 3
 	require.NoError(t, err)
 	require.NotEmpty(t, manifest.Layers)
 
-	// 2. Emulate the corrupt state a prior discard_unpacked_layers=true run
-	//    leaves once the node is switched to discard=false: the overlayfs
-	//    snapshot is intact, but the layer blobs are gone from the content
-	//    store.
+	// 2. Emulate the corrupt state: snapshot intact, blobs gone.
 	cs := ctrdClient.ContentStore()
 	layerDigests := make([]digest.Digest, 0, len(manifest.Layers))
 	for _, layer := range manifest.Layers {
@@ -269,11 +231,8 @@ version = 3
 		require.Truef(t, errdefs.IsNotFound(err), "layer blob %s should be gone, got err=%v", dgst, err)
 	}
 
-	// 3. The core assertion. ImageStatus with NO runtime handler (gate
-	//    disabled) must still report the image absent: the snapshot exists but
-	//    the blobs are gone, and discard_unpacked_layers=false means they are
-	//    expected to be present. Reporting present here would leave the image
-	//    un-reunpackable with no re-pull triggered.
+	// 3. ImageStatus with no handler must report absent: blobs gone,
+	//    discard=false means they're expected present.
 	status, err := iSvc.ImageStatus(&criruntime.ImageSpec{Image: testImage})
 	require.NoError(t, err)
 	assert.Nil(t, status, "image with discarded blobs (discard=false, no handler) should be reported absent")

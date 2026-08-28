@@ -69,14 +69,10 @@ type CRIImageService struct {
 	imageStore *imagestore.Store
 	// snapshotStore stores information of all snapshots.
 	snapshotStore *snapshotstore.Store
-	// snapshotters is the map of snapshotter name to snapshotter used to
-	// verify that an image's snapshot still exists during ImageStatus, so that
-	// images whose content has been discarded (and is no longer usable for the
-	// configured snapshotter) are reported as absent and re-pulled.
+	// snapshotters is used by ImageStatus to check whether an image's
+	// snapshot still exists for a given snapshotter.
 	snapshotters map[string]snapshots.Snapshotter
-	// content is the raw content store used by ImageStatus to verify that
-	// layer blobs are still present (relevant when discard_unpacked_layers is
-	// false and prior discard_unpacked_layers=true pulls left layers missing).
+	// content is used by ImageStatus to verify layer blobs are still present.
 	content content.Store
 	// transferrer is used to pull image with transfer service
 	transferrer transfer.Transferrer
@@ -151,8 +147,6 @@ func NewService(config criconfig.ImageConfig, options *CRIImageServiceOptions) (
 }
 
 // UpdateRuntimeSnapshotter adds or updates the snapshotter mapping for a runtime.
-// This is called by the main CRI plugin after both image and runtime plugins are initialized,
-// to propagate runtime-specific snapshotters configured in the runtime plugin's config.
 func (c *CRIImageService) UpdateRuntimeSnapshotter(runtimeName string, imagePlatform ImagePlatform) {
 	if c.runtimePlatforms == nil {
 		c.runtimePlatforms = make(map[string]ImagePlatform)

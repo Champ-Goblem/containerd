@@ -81,9 +81,7 @@ func initCRIService(ic *plugin.InitContext) (any, error) {
 		return nil, fmt.Errorf("unable to load CRI image service plugin dependency: %w", err)
 	}
 
-	// Propagate runtime-specific snapshotters from runtime config to image service.
-	// This is needed because users may configure snapshotters in the runtime config
-	// (containerd.runtimes.<name>.snapshotter) which the image service needs for pulling.
+	// Propagate per-runtime snapshotters to the image service.
 	runtimeSvc := criRuntimePlugin.(server.RuntimeService)
 	imageSvc := criImagePlugin.(server.ImageService)
 	runtimeConfig := runtimeSvc.Config()
