@@ -19,7 +19,6 @@ package images
 import (
 	"context"
 	"fmt"
-	"maps"
 	"path/filepath"
 	"runtime"
 
@@ -114,19 +113,9 @@ func init() {
 			options.Images = ctrdCli.ImageService()
 			options.Client = ctrdCli
 
-			allSnapshotters := mdb.Snapshotters()
-			defaultSnapshotter := config.Snapshotter
-			if _, ok := allSnapshotters[defaultSnapshotter]; !ok {
-				return nil, fmt.Errorf("failed to find snapshotter %q", defaultSnapshotter)
-			}
-			// Register every available snapshotter, not just the default, so
-			// ImageStatus can consult per-runtime snapshotters that are
-			// propagated via UpdateRuntimeSnapshotter after this plugin init.
-			maps.Copy(options.Snapshotters, allSnapshotters)
-
 			snapshotRoot := func(snapshotter string) (snapshotRoot string) {
 				if plugin := ic.Plugins().Get(plugins.SnapshotPlugin, snapshotter); plugin != nil {
-					snapshotRoot = plugin.Meta.Exports["root"]
+					snapshotRoot = plugin.Meta.Exports[plugins.SnapshotterRootDir]
 				}
 				if snapshotRoot == "" {
 					// Try a root in the same parent as this plugin
@@ -135,8 +124,22 @@ func init() {
 				return snapshotRoot
 			}
 
-			options.ImageFSPaths[defaultSnapshotter] = snapshotRoot(defaultSnapshotter)
-			log.L.Infof("Get image filesystem path %q for snapshotter %q", options.ImageFSPaths[defaultSnapshotter], defaultSnapshotter)
+			allSnapshotters := mdb.Snapshotters()
+			defaultSnapshotter := config.Snapshotter
+			if _, ok := allSnapshotters[defaultSnapshotter]; !ok {
+				return nil, fmt.Errorf("failed to find snapshotter %q", defaultSnapshotter)
+			}
+			// Register every available snapshotter, not just the default. Runtime
+			// plugins propagate their per-runtime snapshotters (e.g. kata's
+			// containerd.runtimes.<name>.snapshotter) via UpdateRuntimeSnapshotter
+			// *after* this plugin initializes, so any snapshotter referenced later
+			// must already be present here for ImageStatus's snapshot-existence
+			// check to consult the correct snapshotter.
+			for snapshotter, snapshotterService := range allSnapshotters {
+				options.Snapshotters[snapshotter] = snapshotterService
+				options.ImageFSPaths[snapshotter] = snapshotRoot(snapshotter)
+				log.L.Infof("Get image filesystem path %q for snapshotter %q", options.ImageFSPaths[snapshotter], snapshotter)
+			}
 
 			for runtimeName, rp := range config.RuntimePlatforms {
 				snapshotter := rp.Snapshotter

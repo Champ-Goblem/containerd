@@ -46,6 +46,7 @@ version = 3
 [plugins.'io.containerd.cri.v1.images']
   snapshotter = "overlayfs"
   disable_snapshot_annotations = false
+  stats_collect_period = 1
 
 [plugins.'io.containerd.cri.v1.runtime'.containerd]
   default_runtime_name = "runc"
@@ -91,6 +92,8 @@ version = 3
 	if initErr := resp.Plugins[0].InitErr; initErr != nil {
 		t.Skipf("erofs snapshotter plugin is not ready: %s", initErr.Message)
 	}
+	erofsRoot := resp.Plugins[0].Exports["root"]
+	require.NotEmpty(t, erofsRoot)
 
 	nginxImage := images.Get(images.Nginx)
 	pullImagesByCRI(t, iSvc, nginxImage)
@@ -121,6 +124,17 @@ version = 3
 	cn2Cfg := ContainerConfig("erofs-container", nginxImage, WithCommand("sleep", "1d"))
 	cn2ID, err := rSvc.CreateContainer(sb2ID, cn2Cfg, sb2Cfg)
 	require.NoError(t, err)
+	require.NoError(t, rSvc.StartContainer(cn2ID))
+
+	var stats *criruntime.ContainerStats
+	require.NoError(t, Eventually(func() (bool, error) {
+		stats, err = rSvc.ContainerStats(cn2ID)
+		if err != nil {
+			return false, err
+		}
+		return stats.GetWritableLayer().GetTimestamp() > 0, nil
+	}, time.Second, 30*time.Second))
+	assert.Equal(t, erofsRoot, stats.GetWritableLayer().GetFsId().GetMountpoint())
 
 	for _, chainID := range chainIDs {
 		snInfo, err := erofsSn.Stat(context.Background(), chainID.String())
@@ -137,8 +151,8 @@ version = 3
 	require.NoError(t, err)
 	assert.Equal(t, "erofs", sb2Status.RuntimeHandler)
 
-	// Container should be created.
+	// Container should be running.
 	cn2Status, err := rSvc.ContainerStatus(cn2ID)
 	require.NoError(t, err)
-	assert.Equal(t, criruntime.ContainerState_CONTAINER_CREATED, cn2Status.State)
+	assert.Equal(t, criruntime.ContainerState_CONTAINER_RUNNING, cn2Status.State)
 }
